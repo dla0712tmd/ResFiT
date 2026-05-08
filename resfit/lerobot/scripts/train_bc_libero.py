@@ -150,12 +150,6 @@ parser.add_argument(
     choices=LIBERO_TASK_SUITES,
     help="LIBERO task suite used for evaluation rollouts.",
 )
-parser.add_argument(
-    "--eval_task_id",
-    type=int,
-    default=0,
-    help="Zero-indexed task ID within the evaluation suite (0–9 for most suites).",
-)
 parser.add_argument("--eval_num_envs", type=int, default=5, help="Parallel environments for evaluation.")
 parser.add_argument(
     "--eval_num_episodes", type=int, default=20, help="Total episodes to run per evaluation."
@@ -174,16 +168,6 @@ parser.add_argument(
     type=str,
     default="observation.images.image",
     help="Observation key for the camera to use for video recording (e.g., 'observation.images.image').",
-)
-parser.add_argument(
-    "--task_index",
-    type=int,
-    default=None,
-    help=(
-        "If set, filter the training dataset to only episodes with this task_index. "
-        "Useful for single-task BC when the dataset contains multiple tasks "
-        "(e.g. lerobot/libero_spatial_image has 10 tasks, task_index 0-9)."
-    ),
 )
 parser.add_argument(
     "--debug",
@@ -253,6 +237,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_suite_num_tasks(suite_name: str) -> int:
+    from libero.libero import benchmark as libero_benchmark
+    benchmark_dict = libero_benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[suite_name]()
+    return len(task_suite.tasks)
 
 
 def _annotate_frame(
@@ -577,59 +568,11 @@ def main(cfg: argparse.Namespace):
     image_transforms_config = ImageTransformsConfig(enable=True)
     image_transforms = ImageTransforms(image_transforms_config)
 
-    # Optional single-task filtering: select only episodes for one task_index.
-    # lerobot/libero_*_image datasets contain 10 tasks; use --task_index 0-9
-    # to train on a single task instead of all tasks.
-    episode_indices = None
-    if cfg.task_index is not None:
-        logger.info(f"Filtering dataset to task_index={cfg.task_index}…")
-
-        # Load the parquet data to build an episode_index → task_index map.
-        # We use a temporary LeRobotDataset with empty delta_timestamps so that
-        # no temporal padding / lookup is required.
-        probe_ds = LeRobotDataset(
-            cfg.dataset,
-            delta_timestamps={},
-            download_videos=False,
-            video_backend="pyav",
-        )
-
-        # hf_dataset has one row per *frame*; we only need one row per episode.
-        ep_col = probe_ds.hf_dataset["episode_index"]
-        task_col = probe_ds.hf_dataset["task_index"]
-
-        ep_to_task: dict[int, int] = {}
-        for ep_idx, t_idx in zip(ep_col, task_col):
-            ep_int = int(ep_idx)
-            if ep_int not in ep_to_task:
-                ep_to_task[ep_int] = int(t_idx)
-
-        del probe_ds
-
-        episode_indices = sorted(
-            ep_idx for ep_idx, t_idx in ep_to_task.items()
-            if t_idx == cfg.task_index
-        )
-
-        if not episode_indices:
-            available = sorted(set(ep_to_task.values()))
-            raise ValueError(
-                f"No episodes found for task_index={cfg.task_index}. "
-                f"Available task indices: {available}"
-            )
-
-        task_desc = ds_meta.tasks.get(cfg.task_index, "")
-        logger.info(
-            f"  task_index={cfg.task_index}: '{task_desc}' → "
-            f"{len(episode_indices)} episodes selected."
-        )
-
     dataset = LeRobotDataset(
         cfg.dataset,
         delta_timestamps=delta_timestamps,
         download_videos=True,
         image_transforms=image_transforms,
-        episodes=episode_indices,
     )
 
     # ---------------------------------------------------------------------
@@ -749,46 +692,15 @@ def main(cfg: argparse.Namespace):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = start_step
-    eval_env = None  # type: ignore  # will hold the evaluation environment if created
 
     # Track the best evaluation success-rate achieved so far (used for early-stopping style checkpointing)
     best_success_rate = 0.0
 
+    eval_num_tasks = 0
     if cfg.rollout_freq and cfg.eval_suite:
-        # ------------------------------------------------------------------
-        # Create the DexMimicGen evaluation environment
-        # ------------------------------------------------------------------
-        device_str = "cpu" if cfg.device == "cpu" else "cuda"
-
-        # Create evaluation environment (vectorized or single based on debug flag)
-        logger.info(f"Creating evaluation environment: {cfg.eval_suite}")
-
-        if cfg.debug:
-            # Debug mode: use synchronous vectorized environment for easier debugging
-            logger.info("Debug mode enabled: using synchronous vectorized environment")
-            eval_env = create_vectorized_libero_env(
-                task_suite_name=cfg.eval_suite,
-                task_id=cfg.eval_task_id,
-                num_envs=cfg.eval_num_envs,
-                device=device_str,
-                camera_size=cfg.eval_camera_size,
-                render_size=cfg.eval_render_size,
-                video_key=cfg.eval_video_key,
-                debug=True,
-            )
-        else:
-            # Production mode: use asynchronous multiprocessing environment for speed
-            logger.info("Production mode: using asynchronous multiprocessing environment")
-            eval_env = create_vectorized_libero_env(
-                task_suite_name=cfg.eval_suite,
-                task_id=cfg.eval_task_id,
-                num_envs=cfg.eval_num_envs,
-                device=device_str,
-                camera_size=cfg.eval_camera_size,
-                render_size=cfg.eval_render_size,
-                video_key=cfg.eval_video_key,
-                debug=False,
-            )
+        logger.info(f"Multi-task evaluation enabled for suite: {cfg.eval_suite}")
+        eval_num_tasks = _get_suite_num_tasks(cfg.eval_suite)
+        logger.info(f"Will evaluate all {eval_num_tasks} tasks in suite '{cfg.eval_suite}' every {cfg.rollout_freq} steps")
 
     while step < cfg.steps:
         # ------------------------------------------------------------------
@@ -850,7 +762,7 @@ def main(cfg: argparse.Namespace):
                 f" | iter: {iter_ms:.1f} ms"
             )
             logger.info(msg)
-            if wandb is not None:
+            if cfg.wandb_enable:
                 wandb.log(
                     {
                         "train/loss": loss_val,
@@ -883,7 +795,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if cfg.wandb_enable:
                 # Log model-only artifact (no optimizer)
                 art_model = wandb.Artifact(name=f"run_{wandb.run.id}_model_step_{step}", type="model")
                 art_model.add_dir(str(model_dir))
@@ -906,48 +818,77 @@ def main(cfg: argparse.Namespace):
             and step != start_step
         ):
             rollout_t0 = time.perf_counter()
+            device_str = "cpu" if cfg.device == "cpu" else "cuda"
 
-            success_rate, video_path, final_fps = _run_rollouts(
-                policy=policy,
-                env=eval_env,
-                save_dir=output_dir,
-                step=step,
-                num_episodes=cfg.eval_num_episodes,
-                run_start_time=run_start_time,
-                eval_suite=cfg.eval_suite,
-                eval_task_id=cfg.eval_task_id,
-                smolvla_tokenizer=smolvla_tokenizer,
-                smolvla_lang_instruction=smolvla_task_lookup.get(cfg.eval_task_id) if smolvla_task_lookup else None,
-            )
+            task_success_rates: dict[int, float] = {}
+            last_video_path = None
+            last_env_fps = 20
 
+            for task_id in range(eval_num_tasks):
+                logger.info(colored(f"[step {step:>6d}] evaluating task {task_id}/{eval_num_tasks - 1}…", "cyan"))
+                task_env = create_vectorized_libero_env(
+                    task_suite_name=cfg.eval_suite,
+                    task_id=task_id,
+                    num_envs=cfg.eval_num_envs,
+                    device=device_str,
+                    camera_size=cfg.eval_camera_size,
+                    render_size=cfg.eval_render_size,
+                    video_key=cfg.eval_video_key,
+                    debug=cfg.debug,
+                )
+
+                success_rate, video_path, final_fps = _run_rollouts(
+                    policy=policy,
+                    env=task_env,
+                    save_dir=output_dir,
+                    step=step,
+                    num_episodes=cfg.eval_num_episodes,
+                    run_start_time=run_start_time,
+                    eval_suite=cfg.eval_suite,
+                    eval_task_id=task_id,
+                    smolvla_tokenizer=smolvla_tokenizer,
+                    smolvla_lang_instruction=smolvla_task_lookup.get(task_id) if smolvla_task_lookup else None,
+                )
+
+                last_env_fps = getattr(task_env, "fps", 20)
+                task_env.close()
+
+                task_success_rates[task_id] = success_rate
+                logger.info(
+                    colored(
+                        f"[step {step:>6d}] task {task_id} success-rate: {success_rate * 100:.1f}%",
+                        "cyan",
+                    )
+                )
+                last_video_path = video_path
+
+            mean_success_rate = sum(task_success_rates.values()) / len(task_success_rates)
             rollout_ms = (time.perf_counter() - rollout_t0) * 1_000
 
             logger.info(
                 colored(
-                    f"[step {step:>6d}] eval success-rate: {success_rate * 100:.1f}% | "
-                    f"rollout: {rollout_ms / 1000:.2f} s | {final_fps:.1f} fps",
+                    f"[step {step:>6d}] mean success-rate: {mean_success_rate * 100:.1f}% | "
+                    f"rollout: {rollout_ms / 1000:.2f} s",
                     "cyan",
                 )
             )
 
-            if wandb is not None:
-                wandb.log(
-                    {
-                        "eval/success_rate": success_rate,
-                        "time/rollout_ms": rollout_ms,
-                    },
-                    step=step,
-                )
-                if video_path is not None and video_path.exists():
-                    fps = eval_env.fps
-                    wandb.log({"eval/rollout_video": wandb.Video(str(video_path), format="mp4", fps=fps)}, step=step)
+            if cfg.wandb_enable:
+                log_dict = {f"eval/task_{tid}_success_rate": sr for tid, sr in task_success_rates.items()}
+                log_dict["eval/mean_success_rate"] = mean_success_rate
+                log_dict["time/rollout_ms"] = rollout_ms
+                wandb.log(log_dict, step=step)
+                if last_video_path is not None and last_video_path.exists():
+                    wandb.log({"eval/rollout_video": wandb.Video(str(last_video_path), format="mp4", fps=last_env_fps)}, step=step)
+
+            success_rate = mean_success_rate
 
             # -------------------------------------------------------------
             # Checkpoint the model whenever we obtain a new best success-rate
             # -------------------------------------------------------------
             if success_rate > best_success_rate:
                 best_success_rate = success_rate
-                logger.info(colored(f"New best success-rate! Saving checkpoint at step {step}", "magenta"))
+                logger.info(colored(f"New best mean success-rate ({best_success_rate * 100:.1f}%)! Saving checkpoint at step {step}", "magenta"))
 
                 # 1) Save model-only weights for lightweight history
                 best_model_dir = output_dir / f"best_step_{step}"
@@ -961,18 +902,15 @@ def main(cfg: argparse.Namespace):
                     shutil.rmtree(best_dir)
                 save_checkpoint(best_dir, step, policy, optimizer)
 
-                if wandb is not None:
+                if cfg.wandb_enable:
                     # Overwrite/refresh the "best" artifact so that the most recent best checkpoint is easy to retrieve
                     art_best = wandb.Artifact(name=f"run_{wandb.run.id}_best", type="model")
                     art_best.add_dir(str(best_dir))
                     wandb.log_artifact(art_best, aliases=["best", "latest"])
 
     logger.info(colored("Training finished!", "green", attrs=["bold"]))
-    if wandb is not None:
+    if cfg.wandb_enable:
         wandb.finish()
-
-    if eval_env is not None:
-        eval_env.close()
 
     # ---------------------------------------------------------------------
     # Cleanup --------------------------------------------------------------
