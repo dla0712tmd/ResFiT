@@ -46,18 +46,19 @@ from typing import Any
 import imageio
 import numpy as np
 import torch
-from lerobot.common.datasets.factory import resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.utils.random_utils import set_seed
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+from lerobot.datasets.utils import cycle
+from lerobot.utils.random_utils import set_seed
 from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
 import wandb
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from resfit.libero.environments.libero import LIBERO_TASK_SUITES, VectorizedLiberoEnvWrapper, create_vectorized_libero_env
-from resfit.lerobot.policies.factory import make_policy, make_policy_config
-from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.factory import make_policy, make_policy_config
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 from resfit.lerobot.utils.load_policy import load_checkpoint, save_checkpoint
 
 # Set multiprocessing start method for CUDA compatibility
@@ -95,6 +96,7 @@ parser.add_argument(
         "pi0fast",
         "tdmpc",
         "vqbet",
+        "smolvla",
     ],
     help="Which policy architecture to train",
 )
@@ -287,7 +289,7 @@ def _annotate_frame(
 
 def _run_rollouts(
     *,
-    policy: PreTrainedPolicy,
+    policy: VecEnvPolicy,
     env: VectorizedLiberoEnvWrapper,
     save_dir: Path,
     step: int,
@@ -295,6 +297,8 @@ def _run_rollouts(
     run_start_time: str,
     eval_suite: str,
     eval_task_id: int,
+    smolvla_tokenizer=None,
+    smolvla_lang_instruction: str | None = None,
 ):
     """Run *num_episodes* episodes with *policy* in vectorized *env* and compute success-rate.
 
@@ -342,7 +346,18 @@ def _run_rollouts(
     while done_episodes < num_episodes:
         # Run episodes in parallel until we complete the required number
         with torch.inference_mode():
-            # Convert numpy observations to PyTorch tensors for the policy
+            # SmolVLA requires tokenized language instructions in the observation
+            if smolvla_tokenizer is not None and smolvla_lang_instruction is not None:
+                task_strs = [smolvla_lang_instruction + "\n"] * env.num_envs
+                tokenized = smolvla_tokenizer(
+                    task_strs,
+                    return_tensors="pt",
+                    padding="longest",
+                    truncation=True,
+                    max_length=48,
+                )
+                obs[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(env.device)
+                obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(env.device)
             action = policy.select_action(obs)
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -634,8 +649,16 @@ def main(cfg: argparse.Namespace):
     # ------------------------------------------------------------------
     # Policy + optimiser
     # ------------------------------------------------------------------
-    policy = make_policy(policy_cfg, ds_meta=ds_meta)
+    policy = VecEnvPolicy(make_policy(policy_cfg, ds_meta=ds_meta))
     policy.train()
+
+    # For SmolVLA, build a tokenizer and a task_index → task_str lookup
+    smolvla_tokenizer = None
+    smolvla_task_lookup = None
+    if cfg.policy == "smolvla":
+        from transformers import AutoTokenizer
+        smolvla_tokenizer = AutoTokenizer.from_pretrained(policy_cfg.vlm_model_name)
+        smolvla_task_lookup = {i: task_str for i, task_str in enumerate(ds_meta.tasks.index)}
 
     # Print the policy config
     print(policy_cfg)
@@ -780,6 +803,21 @@ def main(cfg: argparse.Namespace):
         for key, val in batch.items():
             if isinstance(val, torch.Tensor):
                 batch[key] = val.to(device, non_blocking=True)
+
+        # SmolVLA requires tokenized language instructions in the batch
+        if smolvla_tokenizer is not None:
+            task_indices = batch["task_index"].squeeze(-1).tolist()
+            task_strs = [smolvla_task_lookup[int(i)] + "\n" for i in task_indices]
+            tokenized = smolvla_tokenizer(
+                task_strs,
+                return_tensors="pt",
+                padding=policy_cfg.pad_language_to,
+                truncation=True,
+                max_length=policy_cfg.tokenizer_max_length,
+            )
+            batch[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(device)
+
         data_load_ms = (time.perf_counter() - data_t0) * 1000
 
         # ------------------------------------------------------------------
@@ -878,6 +916,8 @@ def main(cfg: argparse.Namespace):
                 run_start_time=run_start_time,
                 eval_suite=cfg.eval_suite,
                 eval_task_id=cfg.eval_task_id,
+                smolvla_tokenizer=smolvla_tokenizer,
+                smolvla_lang_instruction=smolvla_task_lookup.get(cfg.eval_task_id) if smolvla_task_lookup else None,
             )
 
             rollout_ms = (time.perf_counter() - rollout_t0) * 1_000

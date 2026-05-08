@@ -42,8 +42,8 @@ from tqdm import tqdm
 
 import wandb
 from resfit.dexmg.environments.dexmg import create_vectorized_env
-from resfit.lerobot.policies.act.configuration_act import ACTConfig
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.act.configuration_act import ACTConfig
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
@@ -223,10 +223,10 @@ def main(cfg: ResidualTD3DexmgConfig):
         artifact_version=cfg.base_policy.wt_version,
     )
 
-    base_policy: ACTPolicy = load_policy(policy_dir)
+    base_policy: VecEnvPolicy = load_policy(policy_dir)
     base_policy.to(device)
     base_policy.eval()
-    eval_base_policy: ACTPolicy = load_policy(policy_dir)
+    eval_base_policy: VecEnvPolicy = load_policy(policy_dir)
     eval_base_policy.to(device)
     eval_base_policy.eval()
 
@@ -260,7 +260,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     def get_envs(
         env_name: str,
         num_envs: int,
-        base_policy: ACTPolicy,
+        base_policy: VecEnvPolicy,
         device: str,
         video_key: str,
         debug: bool,
@@ -516,7 +516,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         image_keys: list[str],
         num_episodes: int | None = None,
         use_base_policy_for_base_actions: bool = False,
-        base_policy: ACTPolicy | None = None,
+        base_policy: VecEnvPolicy | None = None,
     ) -> int:
         """
         Iterates through *dataset* sequentially, converts consecutive frames
