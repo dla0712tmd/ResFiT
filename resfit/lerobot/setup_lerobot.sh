@@ -26,5 +26,5 @@ python -m pip install "transformers==5.3.0" "num2words>=0.5.14,<0.6.0" "accelera
 # Install a couple of dependencies
 python -m pip install -r resfit/lerobot/lerobot_requirements.txt
 python -m pip install imageio imageio-ffmpeg
-python -m pip install --upgrade torch torchvision torchcodec
+python -m pip install torch torchvision torchcodec --index-url https://download.pytorch.org/whl/cu128
 python -m pip install "datasets>=4.0.0,<5.0.0"

@@ -22,8 +22,8 @@ from typing import Any
 
 import h5py
 import numpy as np
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import write_info
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import write_info
 from tqdm import tqdm
 
 

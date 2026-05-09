@@ -63,6 +63,11 @@ class VecEnvPolicy(nn.Module):
                 if i < len(self._action_queues):
                     self._action_queues[i].clear()
 
+        # Reset the inner policy's observation queues (e.g. DiffusionPolicy._queues).
+        # Only do a full reset since _queues are shared across all envs in the batch.
+        if env_ids is None and hasattr(self.policy, "reset"):
+            self.policy.reset()
+
     def _ensure_action_queues(self, batch_size: int) -> None:
         n_steps = self.config.n_action_steps
         if not hasattr(self, "_action_queues"):
@@ -71,6 +76,32 @@ class VecEnvPolicy(nn.Module):
             self._action_queues.append(deque(maxlen=n_steps))
         if len(self._action_queues) > batch_size:
             self._action_queues = self._action_queues[:batch_size]
+
+    def _maybe_populate_obs_queues(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Populate the inner policy's observation queues if it uses them (e.g. DiffusionPolicy).
+
+        DiffusionPolicy.predict_action_chunk iterates over the *input batch's keys* to decide
+        which queues to read, so the returned batch must include the synthetic
+        "observation.images" key (stacked from individual camera keys) that the queue was
+        populated with.  ACT-style policies don't have _queues, so the original batch is
+        returned unchanged.
+
+        Note: _queues are shared across all envs in the batch, so selective per-env
+        population is not supported. All envs must be in sync (same timestep).
+        """
+        if not hasattr(self.policy, "_queues"):
+            return batch
+        from lerobot.policies.utils import populate_queues
+
+        obs_batch = {k: v for k, v in batch.items() if k != "action"}
+        if getattr(self.policy.config, "image_features", None):
+            obs_batch = dict(obs_batch)
+            obs_batch["observation.images"] = torch.stack(
+                [obs_batch[k] for k in self.policy.config.image_features if k in obs_batch],
+                dim=-4,
+            )
+        self.policy._queues = populate_queues(self.policy._queues, obs_batch)
+        return obs_batch
 
     def _ensure_temporal_ensemblers(self, batch_size: int) -> None:
         from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
@@ -93,16 +124,18 @@ class VecEnvPolicy(nn.Module):
         temporal_coeff = getattr(self.config, "temporal_ensemble_coeff", None)
         if temporal_coeff is not None:
             self._ensure_temporal_ensemblers(batch_size)
-            chunk = self.policy.predict_action_chunk(batch)  # (B, chunk_size, act_dim)
+            obs_batch = self._maybe_populate_obs_queues(batch)
+            chunk = self.policy.predict_action_chunk(obs_batch)  # (B, chunk_size, act_dim)
             return torch.cat(
                 [self._temporal_ensemblers[i].update(chunk[i : i + 1]) for i in range(batch_size)],
                 dim=0,
             )
 
         self._ensure_action_queues(batch_size)
+        obs_batch = self._maybe_populate_obs_queues(batch)
         envs_needing_chunk = [i for i, q in enumerate(self._action_queues) if len(q) == 0]
         if envs_needing_chunk:
-            chunk = self.policy.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            chunk = self.policy.predict_action_chunk(obs_batch)[:, : self.config.n_action_steps]
             for i in envs_needing_chunk:
                 self._action_queues[i].extend(chunk[i].unbind(0))
         return torch.stack([q.popleft() for q in self._action_queues], dim=0)
