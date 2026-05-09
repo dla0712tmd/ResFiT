@@ -28,7 +28,7 @@ from pathlib import Path
 import hydra
 import numpy as np
 import torch
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
