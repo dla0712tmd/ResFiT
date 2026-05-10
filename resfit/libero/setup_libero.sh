@@ -45,7 +45,7 @@ python -m pip install torchrl==0.8.0 tensordict==0.8.2 torchcodec==0.4.0
 
 python -m pip install mujoco==3.3.2 "protobuf>4.21.0,<5" diffusers==0.33.1 llvmlite==0.42.0 multidict==6.0.5 numba==0.59.1
 
-micromamba install -n residual -c conda-forge "ffmpeg>=6,<8" -y
+conda install -n residual -c conda-forge "ffmpeg>=6,<8" -y
 
 # Upgrade to a Numba that supports NumPy 2.x (and its llvmlite)
 pip install --upgrade --no-cache-dir "numba>=0.60" "llvmlite>=0.44"
