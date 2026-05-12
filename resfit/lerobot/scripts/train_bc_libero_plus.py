@@ -63,6 +63,7 @@ from lerobot.policies.factory import make_policy, make_policy_config
 from resfit.libero.environments.libero_plus import (
     LIBERO_PLUS_TASK_SUITES,
     VectorizedLiberoEnvWrapper,
+    create_multi_task_libero_plus_env,
     create_vectorized_libero_plus_env,
 )
 from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
@@ -144,8 +145,7 @@ parser.add_argument(
     choices=LIBERO_PLUS_TASK_SUITES,
     help="LIBERO-plus task suite used for evaluation rollouts.",
 )
-parser.add_argument("--eval_num_envs", type=int, default=5)
-parser.add_argument("--eval_num_episodes", type=int, default=20)
+parser.add_argument("--eval_num_envs", type=int, default=8)
 parser.add_argument("--eval_camera_size", type=int, default=256)
 parser.add_argument("--eval_render_size", type=int, default=None)
 parser.add_argument(
@@ -221,6 +221,188 @@ def _get_suite_num_tasks(suite_name: str) -> int:
     benchmark_dict = libero_benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[suite_name]()
     return len(task_suite.tasks)
+
+
+def _load_task_info(suite_name: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Return (task_id -> category, task_id -> language_instruction) for a suite.
+
+    Matches benchmark task ordering (0-indexed) to the task_classification.json
+    entries by task name.
+    """
+    from pathlib import Path as _Path
+    import libero.libero.benchmark as _bench_pkg
+    from libero.libero import benchmark as libero_benchmark
+
+    json_path = _Path(_bench_pkg.__file__).parent / "task_classification.json"
+    with open(json_path) as f:
+        classification = json.load(f)
+
+    suite_entries = classification.get(suite_name, [])
+    if not suite_entries:
+        raise ValueError(f"No classification data for suite '{suite_name}' in task_classification.json")
+    name_to_category: dict[str, str] = {e["name"]: e["category"] for e in suite_entries}
+
+    benchmark_dict = libero_benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[suite_name]()
+    tasks = task_suite.tasks
+
+    task_id_to_category: dict[int, str] = {}
+    task_id_to_language: dict[int, str] = {}
+    for task_id, task in enumerate(tasks):
+        cat = name_to_category.get(task.name)
+        if cat is None:
+            logger.warning(f"Task '{task.name}' not found in classification JSON; labelled 'Unknown'")
+            cat = "Unknown"
+        task_id_to_category[task_id] = cat
+        task_id_to_language[task_id] = getattr(task, "language", "")
+
+    return task_id_to_category, task_id_to_language
+
+
+def _run_eval(
+    *,
+    policy: VecEnvPolicy,
+    eval_suite: str,
+    num_envs: int,
+    device_str: str,
+    camera_size: int,
+    render_size: int | None,
+    video_key: str,
+    save_dir: Path,
+    step: int,
+    run_start_time: str,
+    debug: bool,
+    smolvla_tokenizer=None,
+) -> tuple[dict[str, float], float, Path | None]:
+    """Evaluate 1 episode per task, all tasks, results by perturbation category.
+
+    Batches ``num_envs`` tasks at a time (each sub-env runs a *different* task).
+    Returns (category_success_rates, overall_success_rate, video_path).
+    """
+    task_category_map, task_language_map = _load_task_info(eval_suite)
+    num_tasks = len(task_category_map)
+
+    logger.info(colored(
+        f"Paper eval [{eval_suite}]: {num_tasks} tasks × 1 episode, {num_envs} tasks in parallel",
+        "cyan",
+    ))
+
+    policy_was_training = policy.training
+    policy.eval()
+    device = torch.device(device_str)
+
+    task_success: dict[int, bool] = {}
+    video_path: Path | None = None
+    video_writer = None
+    start_time = time.perf_counter()
+
+    all_task_ids = list(range(num_tasks))
+    num_batches = (num_tasks + num_envs - 1) // num_envs
+
+    for batch_idx, batch_start in enumerate(range(0, num_tasks, num_envs)):
+        batch_task_ids = all_task_ids[batch_start : batch_start + num_envs]
+        actual_n = len(batch_task_ids)
+
+        env = create_multi_task_libero_plus_env(
+            task_suite_name=eval_suite,
+            task_ids=batch_task_ids,
+            device=device_str,
+            camera_size=camera_size,
+            render_size=render_size,
+            video_key=video_key,
+            debug=debug,
+        )
+
+        # Record a single video from the very first batch (first sub-env only)
+        if batch_idx == 0:
+            try:
+                now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                parent_dir = save_dir / f"eval_{eval_suite}" / run_start_time
+                parent_dir.mkdir(parents=True, exist_ok=True)
+                video_path = parent_dir / f"eval_step_{step}_{now}.mp4"
+                video_writer = imageio.get_writer(video_path.as_posix(), fps=20)
+            except Exception as e:
+                logger.warning(f"Could not open video writer: {e}")
+                video_writer = None
+
+        obs, _ = env.reset()
+        done_flags = torch.zeros(actual_n, dtype=torch.bool, device=device)
+        success_flags = torch.zeros(actual_n, dtype=torch.bool, device=device)
+        policy.reset()
+
+        while not done_flags.all():
+            with torch.inference_mode():
+                if smolvla_tokenizer is not None:
+                    task_strs = [task_language_map.get(tid, "") + "\n" for tid in batch_task_ids]
+                    tokenized = smolvla_tokenizer(
+                        task_strs,
+                        return_tensors="pt",
+                        padding="longest",
+                        truncation=True,
+                        max_length=48,
+                    )
+                    obs[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
+                    obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(device)
+                action = policy.select_action(obs)
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated | truncated
+            newly_done = done & ~done_flags
+
+            if video_writer is not None and batch_idx == 0:
+                try:
+                    frames = env.render()
+                    video_writer.append_data(frames[0])
+                except Exception:
+                    pass
+
+            if newly_done.any():
+                success_flags |= newly_done & (reward >= 1.0)
+                done_flags |= newly_done
+                policy.reset(env_ids=torch.where(newly_done)[0])
+
+        if video_writer is not None and batch_idx == 0:
+            video_writer.close()
+            video_writer = None
+
+        env.close()
+
+        for i, task_id in enumerate(batch_task_ids):
+            task_success[task_id] = bool(success_flags[i].item())
+
+        if (batch_idx + 1) % max(1, num_batches // 10) == 0 or batch_idx == num_batches - 1:
+            elapsed = time.perf_counter() - start_time
+            done_tasks = min(batch_start + num_envs, num_tasks)
+            cur_rate = sum(task_success.values()) / len(task_success)
+            logger.info(
+                f"  [{eval_suite}] {done_tasks}/{num_tasks} tasks "
+                f"| running SR: {cur_rate * 100:.1f}% | {elapsed:.0f}s"
+            )
+
+    # Aggregate by perturbation category
+    category_successes: dict[str, list[bool]] = {}
+    for task_id, success in task_success.items():
+        cat = task_category_map.get(task_id, "Unknown")
+        category_successes.setdefault(cat, []).append(success)
+
+    category_rates = {
+        cat: sum(vals) / len(vals) for cat, vals in sorted(category_successes.items())
+    }
+    overall_rate = sum(task_success.values()) / len(task_success) if task_success else 0.0
+
+    total_elapsed = time.perf_counter() - start_time
+    logger.info(colored(
+        f"Eval done: {overall_rate * 100:.1f}% overall | "
+        f"{num_tasks} tasks in {total_elapsed:.1f}s",
+        "cyan",
+    ))
+    for cat, rate in category_rates.items():
+        logger.info(f"  {cat}: {rate * 100:.1f}%")
+
+    if policy_was_training:
+        policy.train()
+
+    return category_rates, overall_rate, video_path
 
 
 def _annotate_frame(
@@ -596,14 +778,14 @@ def main(cfg: argparse.Namespace):
     step = start_step
     best_success_rate = 0.0
 
-    eval_num_tasks = 0
     if cfg.rollout_freq and cfg.eval_suite:
-        logger.info(f"Multi-task evaluation enabled for suite: {cfg.eval_suite}")
         eval_num_tasks = _get_suite_num_tasks(cfg.eval_suite)
-        logger.info(
-            f"Will evaluate all {eval_num_tasks} tasks in suite '{cfg.eval_suite}' "
-            f"every {cfg.rollout_freq} steps"
-        )
+        logger.info(colored(
+            f"Eval enabled: suite='{cfg.eval_suite}', "
+            f"{eval_num_tasks} tasks × 1 episode, {cfg.eval_num_envs} tasks in parallel, "
+            f"every {cfg.rollout_freq} steps",
+            "cyan",
+        ))
 
     while step < cfg.steps:
         iter_start_t = time.perf_counter()
@@ -703,74 +885,34 @@ def main(cfg: argparse.Namespace):
             rollout_t0 = time.perf_counter()
             device_str = "cpu" if cfg.device == "cpu" else "cuda"
 
-            task_success_rates: dict[int, float] = {}
-            last_video_path = None
-            last_env_fps = 20
-
-            for task_id in range(eval_num_tasks):
-                logger.info(
-                    colored(
-                        f"[step {step:>6d}] evaluating task {task_id}/{eval_num_tasks - 1}…",
-                        "cyan",
-                    )
-                )
-                task_env = create_vectorized_libero_plus_env(
-                    task_suite_name=cfg.eval_suite,
-                    task_id=task_id,
-                    num_envs=cfg.eval_num_envs,
-                    device=device_str,
-                    camera_size=cfg.eval_camera_size,
-                    render_size=cfg.eval_render_size,
-                    video_key=cfg.eval_video_key,
-                    debug=cfg.debug,
-                )
-
-                success_rate, video_path, final_fps = _run_rollouts(
-                    policy=policy,
-                    env=task_env,
-                    save_dir=output_dir,
-                    step=step,
-                    num_episodes=cfg.eval_num_episodes,
-                    run_start_time=run_start_time,
-                    eval_suite=cfg.eval_suite,
-                    eval_task_id=task_id,
-                    smolvla_tokenizer=smolvla_tokenizer,
-                    smolvla_lang_instruction=(
-                        smolvla_task_lookup.get(task_id) if smolvla_task_lookup else None
-                    ),
-                )
-
-                last_env_fps = getattr(task_env, "fps", 20)
-                task_env.close()
-
-                task_success_rates[task_id] = success_rate
-                logger.info(
-                    colored(
-                        f"[step {step:>6d}] task {task_id} success-rate: {success_rate * 100:.1f}%",
-                        "cyan",
-                    )
-                )
-                last_video_path = video_path
-
-            mean_success_rate = sum(task_success_rates.values()) / len(task_success_rates)
-            rollout_ms = (time.perf_counter() - rollout_t0) * 1_000
-
-            logger.info(
-                colored(
-                    f"[step {step:>6d}] mean success-rate: {mean_success_rate * 100:.1f}% | "
-                    f"rollout: {rollout_ms / 1000:.2f} s",
-                    "cyan",
-                )
+            category_rates, mean_success_rate, last_video_path = _run_eval(
+                policy=policy,
+                eval_suite=cfg.eval_suite,
+                num_envs=cfg.eval_num_envs,
+                device_str=device_str,
+                camera_size=cfg.eval_camera_size,
+                render_size=cfg.eval_render_size,
+                video_key=cfg.eval_video_key,
+                save_dir=output_dir,
+                step=step,
+                run_start_time=run_start_time,
+                debug=cfg.debug,
+                smolvla_tokenizer=smolvla_tokenizer,
             )
 
+            rollout_ms = (time.perf_counter() - rollout_t0) * 1_000
+
             if cfg.wandb_enable:
-                log_dict = {f"eval/task_{tid}_success_rate": sr for tid, sr in task_success_rates.items()}
+                log_dict = {
+                    f"eval/category/{cat}": rate
+                    for cat, rate in category_rates.items()
+                }
                 log_dict["eval/mean_success_rate"] = mean_success_rate
                 log_dict["time/rollout_ms"] = rollout_ms
                 wandb.log(log_dict, step=step)
                 if last_video_path is not None and last_video_path.exists():
                     wandb.log(
-                        {"eval/rollout_video": wandb.Video(str(last_video_path), format="mp4", fps=last_env_fps)},
+                        {"eval/rollout_video": wandb.Video(str(last_video_path), format="mp4", fps=20)},
                         step=step,
                     )
 
@@ -831,7 +973,7 @@ if __name__ == "__main__":
             --batch_size 32 --num_workers 8 \\
             --wandb_project libero-plus-test \\
             --rollout_freq 5000 --eval_suite libero_spatial \\
-            --eval_num_envs 8 --eval_num_episodes 20 \\
+            --eval_num_envs 8 \\
             --eval_camera_size 256 --eval_render_size 256 \\
             --eval_video_key observation.images.front \\
             --wandb_enable
@@ -858,7 +1000,7 @@ if __name__ == "__main__":
             --dataset lerobot/libero_plus \\
             --policy act \\
             --rollout_freq 1000 --eval_suite libero_spatial \\
-            --eval_num_envs 2 --eval_num_episodes 4 \\
+            --eval_num_envs 2 \\
             --debug
 
     Observation key differences vs. standard LIBERO

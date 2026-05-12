@@ -177,6 +177,84 @@ def make_libero_plus_env(
     return _make
 
 
+def create_multi_task_libero_plus_env(
+    task_suite_name: str,
+    task_ids: list[int],
+    device: str = "cpu",
+    camera_size: int = 256,
+    render_size: int | tuple[int, int] | None = None,
+    debug: bool = False,
+    video_key: str = "observation.images.front",
+) -> VectorizedLiberoEnvWrapper:
+    """Create a vectorised LIBERO-plus env where each sub-env runs a *different* task.
+
+    Used by the paper-style evaluation: one episode per task, all tasks evaluated,
+    with ``len(task_ids)`` tasks running in parallel (one per sub-env).
+
+    Args:
+        task_suite_name: One of the LIBERO-plus task suite names.
+        task_ids: Zero-indexed task IDs, one per sub-env (must be non-empty).
+        device: PyTorch device string for tensor conversion.
+        camera_size: Pixel resolution (height = width) for policy cameras.
+        render_size: Resolution for video recording frames.
+        debug: If ``True`` uses ``SyncVectorEnv`` (easier to debug).
+        video_key: Observation key whose camera is used for video recording.
+
+    Returns:
+        A :class:`VectorizedLiberoEnvWrapper` wrapping the vector env.
+    """
+    if not task_ids:
+        raise ValueError("task_ids must be non-empty")
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None:
+        visible_ids = [int(x) for x in cuda_visible.split(",") if x.strip()]
+    else:
+        visible_ids = list(range(max(torch.cuda.device_count(), 1)))
+
+    num_gpus = len(visible_ids) if visible_ids else 1
+    num_envs = len(task_ids)
+
+    env_fns = [
+        make_libero_plus_env(
+            task_suite_name=task_suite_name,
+            task_id=task_id,
+            camera_size=camera_size,
+            render_size=render_size,
+            render_gpu_device_id=visible_ids[env_idx % num_gpus] if visible_ids else 0,
+            env_id=env_idx,
+        )
+        for env_idx, task_id in enumerate(task_ids)
+    ]
+
+    if debug:
+        vec_env = gym.vector.SyncVectorEnv(
+            env_fns,
+            autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+        )
+    else:
+        vec_env = gym.vector.AsyncVectorEnv(
+            env_fns,
+            shared_memory=True,
+            copy=True,
+            context="spawn",
+            autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+        )
+
+    vec_env.call("set_wrapper_attr", "video_key", video_key)
+
+    wrapped = VectorizedLiberoEnvWrapper(vec_env, video_key, device)
+    wrapped.env_name = f"{task_suite_name}/multi_task"
+    wrapped.camera_size = camera_size
+    wrapped.render_size = render_size
+
+    logger.info(
+        f"Created {num_envs} vectorized LIBERO-plus envs "
+        f"[{task_suite_name}/tasks {task_ids[0]}..{task_ids[-1]}]"
+    )
+    return wrapped
+
+
 def create_vectorized_libero_plus_env(
     task_suite_name: str,
     task_id: int,
