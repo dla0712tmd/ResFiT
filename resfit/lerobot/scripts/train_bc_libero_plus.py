@@ -21,8 +21,8 @@ Key features
 
 Example
 =======
-python train_hf.py \
-    --dataset lerobot/libero_spatial_image \
+python -m resfit.lerobot.scripts.train_bc_libero_plus \
+    --dataset lerobot/libero_plus \
     --policy act \
     --wandb_enable --wandb_project my_robot_runs
 """
@@ -34,12 +34,13 @@ import pathlib as _pathlib
 import sys as _sys
 
 _repo_root = _pathlib.Path(__file__).resolve().parents[3]
-# Ensure standard LIBERO (deps/libero) is first on sys.path so its `libero`
-# package is resolved before LIBERO-plus, regardless of libero-path.pth state.
-_sys.path.insert(0, str(_repo_root / "deps" / "libero"))
-# Point the LIBERO config to the standard LIBERO-specific directory so BDDL
-# and asset paths do not collide with the LIBERO-plus config (~/.libero).
-_os.environ.setdefault("LIBERO_CONFIG_PATH", str(_repo_root / "deps" / "libero" / ".libero_config"))
+# Ensure LIBERO-plus (deps/libero_plus) is first on sys.path so its `libero`
+# package is resolved before standard LIBERO, regardless of libero-path.pth state.
+_sys.path.insert(0, str(_repo_root / "deps" / "libero_plus"))
+# Point the LIBERO config to the LIBERO-plus-specific directory so BDDL and
+# asset paths (including 2000+ variants) do not collide with the standard LIBERO
+# config (~/.libero).
+_os.environ.setdefault("LIBERO_CONFIG_PATH", str(_repo_root / "deps" / "libero_plus" / ".libero_config"))
 del _os, _pathlib, _repo_root, _sys
 
 import argparse
@@ -69,7 +70,11 @@ from termcolor import colored
 
 import wandb
 from lerobot.utils.constants import ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-from resfit.libero.environments.libero import LIBERO_TASK_SUITES, VectorizedLiberoEnvWrapper, create_vectorized_libero_env
+from resfit.libero.environments.libero_plus import (
+    LIBERO_PLUS_TASK_SUITES,
+    VectorizedLiberoEnvWrapper,
+    create_vectorized_libero_plus_env,
+)
 from lerobot.policies.factory import make_policy, make_policy_config
 from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 from resfit.lerobot.utils.load_policy import load_checkpoint, save_checkpoint
@@ -95,7 +100,7 @@ parser = argparse.ArgumentParser(description="Offline training on a HF Hub datas
 
 # Required args
 parser.add_argument(
-    "--dataset", type=str, required=True, help="HF Hub dataset repo-id or local path, e.g. 'lerobot/libero_spatial_image'",
+    "--dataset", type=str, required=True, help="HF Hub dataset repo-id or local path, e.g. 'lerobot/libero_plus'",
 )
 parser.add_argument(
     "--policy",
@@ -154,7 +159,7 @@ parser.add_argument(
     default=None,
     help=(
         "Frequency (in optimization steps) at which to run rollouts in a "
-        "LIBERO environment to compute the success-rate of the current "
+        "LIBERO-plus environment to compute the success-rate of the current "
         "policy. Disabled when not set."
     ),
 )
@@ -162,8 +167,8 @@ parser.add_argument(
     "--eval_suite",
     type=str,
     default=None,
-    choices=LIBERO_TASK_SUITES,
-    help="LIBERO task suite used for evaluation rollouts.",
+    choices=LIBERO_PLUS_TASK_SUITES,
+    help="LIBERO-plus task suite used for evaluation rollouts.",
 )
 parser.add_argument("--eval_num_envs", type=int, default=5, help="Parallel environments for evaluation.")
 parser.add_argument(
@@ -181,8 +186,12 @@ parser.add_argument(
 parser.add_argument(
     "--eval_video_key",
     type=str,
-    default="observation.images.image",
-    help="Observation key for the camera to use for video recording (e.g., 'observation.images.image').",
+    default="observation.images.front",
+    help=(
+        "Observation key for the camera used for video recording. "
+        "LIBERO-plus datasets use 'observation.images.front' (agentview) "
+        "or 'observation.images.wrist' (wrist camera)."
+    ),
 )
 parser.add_argument(
     "--debug",
@@ -219,7 +228,7 @@ parser.add_argument(
     default=None,
     help=(
         "List of camera names to use for the policy. If not specified, all cameras from the dataset will be used. "
-        "Example: --policy_cameras agentview robot0_eye_in_hand"
+        "Example: --policy_cameras front wrist"
     ),
 )
 
@@ -962,7 +971,7 @@ def main(cfg: argparse.Namespace):
 
             for task_id in range(eval_num_tasks):
                 logger.info(colored(f"[step {step:>6d}] evaluating task {task_id}/{eval_num_tasks - 1}…", "cyan"))
-                task_env = create_vectorized_libero_env(
+                task_env = create_vectorized_libero_plus_env(
                     task_suite_name=cfg.eval_suite,
                     task_id=task_id,
                     num_envs=cfg.eval_num_envs,
@@ -1063,25 +1072,25 @@ if __name__ == "__main__":
     """
     Example commands:
 
-    LIBERO environment training with high-resolution video recording and parallel environments:
+    LIBERO-plus environment training with high-resolution video recording and parallel environments:
 
     # Production mode (default): uses asynchronous multiprocessing for faster evaluation
-    python -m resfit.lerobot.scripts.train_bc_libero \
-        --dataset lerobot/libero_spatial_image \
+    python -m resfit.lerobot.scripts.train_bc_libero_plus \
+        --dataset lerobot/libero_plus \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project libero-test \
+        --wandb_project libero-plus-test \
         --rollout_freq 1000 --eval_suite libero_spatial \
         --eval_num_envs 8 \
         --eval_num_episodes 20 \
         --eval_camera_size 256 --eval_render_size 256
 
     # Debug mode: uses synchronous environments for easier debugging with ipdb
-    python -m resfit.lerobot.scripts.train_bc_libero \
-        --dataset lerobot/libero_spatial_image \
+    python -m resfit.lerobot.scripts.train_bc_libero_plus \
+        --dataset lerobot/libero_plus \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project libero-test \
+        --wandb_project libero-plus-test \
         --rollout_freq 1000 --eval_suite libero_spatial \
         --eval_num_envs 4 \
         --eval_num_episodes 12 \
@@ -1089,11 +1098,11 @@ if __name__ == "__main__":
         --debug
 
     # Train without proprioceptive observations (vision-only)
-    python -m resfit.lerobot.scripts.train_bc_libero \
-        --dataset lerobot/libero_spatial_image \
+    python -m resfit.lerobot.scripts.train_bc_libero_plus \
+        --dataset lerobot/libero_plus \
         --policy act \
         --batch_size 64 --num_workers 8 \
-        --wandb_project libero-test \
+        --wandb_project libero-plus-test \
         --disable_proprioceptive_obs
 
     IMPORTANT: Parallel Environment Implementation
