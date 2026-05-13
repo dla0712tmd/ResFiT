@@ -35,7 +35,7 @@ python -m pip install gymnasium==1.1.1
 python -m pip install PyOpenGL-accelerate
 
 # Original additional installs
-python -m pip install ipdb serial deepdiff
+python -m pip install ipdb pyserial deepdiff matplotlib
 
 python -m pip install -U "numba>=0.59" "llvmlite>=0.42"
 

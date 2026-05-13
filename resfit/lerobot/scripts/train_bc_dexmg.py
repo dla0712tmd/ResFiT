@@ -45,18 +45,18 @@ from typing import Any
 import imageio
 import numpy as np
 import torch
-from lerobot.common.datasets.factory import resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.utils.random_utils import set_seed
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+from lerobot.datasets.utils import cycle
+from lerobot.utils.random_utils import set_seed
 from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
 import wandb
 from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper, create_vectorized_env
-from resfit.lerobot.policies.factory import make_policy, make_policy_config
-from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.factory import make_policy, make_policy_config
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 from resfit.lerobot.utils.load_policy import load_checkpoint, save_checkpoint
 
 # Set multiprocessing start method for CUDA compatibility
@@ -269,7 +269,7 @@ def _annotate_frame(
 
 def _run_rollouts(
     *,
-    policy: PreTrainedPolicy,
+    policy: VecEnvPolicy,
     env: VectorizedEnvWrapper,
     save_dir: Path,
     step: int,

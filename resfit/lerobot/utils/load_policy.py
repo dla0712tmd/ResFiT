@@ -1,4 +1,4 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.  
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
@@ -10,8 +10,7 @@ from pathlib import Path
 import torch
 import wandb
 
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
-from resfit.lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 
 
 def download_policy_from_wandb(
@@ -51,27 +50,14 @@ def download_policy_from_wandb(
     return policy_dir, checkpoint_step
 
 
-def load_policy(policy_dir: Path) -> ACTPolicy:
-    """Infer policy type (diffusion / act) from `config.json` and load weights."""
-
-    with (policy_dir / "config.json").open() as f:
-        cfg_dict = json.load(f)
-
-    policy_name_field = str(cfg_dict.get("type", "")).lower()
-
-    # TODO: improve policy-type inference logic when additional policies are added
-    if "diffusion" in policy_name_field:
-        raise NotImplementedError("Diffusion policy not implemented")
-        return DiffusionPolicy.from_pretrained(policy_dir)
-    if "use_vae" in cfg_dict:
-        return ACTPolicy.from_pretrained(policy_dir)
-
-    raise ValueError(f"Unknown policy type: {policy_name_field}")
+def load_policy(policy_dir: Path) -> VecEnvPolicy:
+    """Load a policy checkpoint and wrap it with VecEnvPolicy for vectorized-env support."""
+    return VecEnvPolicy.from_pretrained(policy_dir)
 
 
 def save_checkpoint(ckpt_dir: Path, step: int, policy, optimizer) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    # Save model weights + config
+    # Save model weights + config (delegates to the underlying upstream policy)
     policy.save_pretrained(ckpt_dir / "policy")
     # Save optimizer & misc state
     torch.save(
@@ -88,6 +74,6 @@ def load_checkpoint(ckpt_dir: Path, policy, optimizer):
     if not state_pth.exists():
         raise FileNotFoundError(state_pth)
     state = torch.load(state_pth, map_location="cpu")
-    policy_loaded = policy.from_pretrained(ckpt_dir / "policy")
+    policy_loaded = VecEnvPolicy.from_pretrained(ckpt_dir / "policy")
     optimizer.load_state_dict(state["optimizer"])
     return state["step"], policy_loaded, optimizer

@@ -46,18 +46,19 @@ from typing import Any
 import imageio
 import numpy as np
 import torch
-from lerobot.common.datasets.factory import resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.transforms import ImageTransforms, ImageTransformsConfig
-from lerobot.common.datasets.utils import cycle
-from lerobot.common.utils.random_utils import set_seed
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+from lerobot.datasets.utils import cycle
+from lerobot.utils.random_utils import set_seed
 from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
 import wandb
+from lerobot.utils.constants import ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from resfit.libero.environments.libero import LIBERO_TASK_SUITES, VectorizedLiberoEnvWrapper, create_vectorized_libero_env
-from resfit.lerobot.policies.factory import make_policy, make_policy_config
-from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.factory import make_policy, make_policy_config
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 from resfit.lerobot.utils.load_policy import load_checkpoint, save_checkpoint
 
 # Set multiprocessing start method for CUDA compatibility
@@ -92,9 +93,12 @@ parser.add_argument(
         "act",
         "latent_act",
         "pi0",
-        "pi0fast",
+        "pi0_fast",
+        "pi05",
         "tdmpc",
         "vqbet",
+        "multi_task_dit",
+        "smolvla",
     ],
     help="Which policy architecture to train",
 )
@@ -148,12 +152,6 @@ parser.add_argument(
     choices=LIBERO_TASK_SUITES,
     help="LIBERO task suite used for evaluation rollouts.",
 )
-parser.add_argument(
-    "--eval_task_id",
-    type=int,
-    default=0,
-    help="Zero-indexed task ID within the evaluation suite (0–9 for most suites).",
-)
 parser.add_argument("--eval_num_envs", type=int, default=5, help="Parallel environments for evaluation.")
 parser.add_argument(
     "--eval_num_episodes", type=int, default=20, help="Total episodes to run per evaluation."
@@ -172,16 +170,6 @@ parser.add_argument(
     type=str,
     default="observation.images.image",
     help="Observation key for the camera to use for video recording (e.g., 'observation.images.image').",
-)
-parser.add_argument(
-    "--task_index",
-    type=int,
-    default=None,
-    help=(
-        "If set, filter the training dataset to only episodes with this task_index. "
-        "Useful for single-task BC when the dataset contains multiple tasks "
-        "(e.g. lerobot/libero_spatial_image has 10 tasks, task_index 0-9)."
-    ),
 )
 parser.add_argument(
     "--debug",
@@ -253,6 +241,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _get_suite_num_tasks(suite_name: str) -> int:
+    from libero.libero import benchmark as libero_benchmark
+    benchmark_dict = libero_benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[suite_name]()
+    return len(task_suite.tasks)
+
+
 def _annotate_frame(
     frame: np.ndarray,
     env_idx: int,
@@ -287,7 +282,7 @@ def _annotate_frame(
 
 def _run_rollouts(
     *,
-    policy: PreTrainedPolicy,
+    policy: VecEnvPolicy,
     env: VectorizedLiberoEnvWrapper,
     save_dir: Path,
     step: int,
@@ -295,6 +290,9 @@ def _run_rollouts(
     run_start_time: str,
     eval_suite: str,
     eval_task_id: int,
+    smolvla_tokenizer=None,
+    smolvla_lang_instruction: str | None = None,
+    pi0_fast_ctx: dict | None = None,
 ):
     """Run *num_episodes* episodes with *policy* in vectorized *env* and compute success-rate.
 
@@ -342,7 +340,49 @@ def _run_rollouts(
     while done_episodes < num_episodes:
         # Run episodes in parallel until we complete the required number
         with torch.inference_mode():
-            # Convert numpy observations to PyTorch tensors for the policy
+            # SmolVLA / multi_task_dit: simple task-string tokenization
+            if smolvla_tokenizer is not None and smolvla_lang_instruction is not None:
+                task_strs = [smolvla_lang_instruction + "\n"] * env.num_envs
+                tokenized = smolvla_tokenizer(
+                    task_strs,
+                    return_tensors="pt",
+                    padding="longest",
+                    truncation=True,
+                    max_length=48,
+                )
+                obs[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(env.device)
+                obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(env.device)
+
+            # Pi0Fast: build "Task: ..., State: ...;\n" prompts from current obs state
+            if pi0_fast_ctx is not None and smolvla_lang_instruction is not None:
+                paligemma_tok = pi0_fast_ctx["paligemma_tok"]
+                state = obs.get("observation.state")
+                if state is not None:
+                    if pi0_fast_ctx["state_mean"] is not None:
+                        s_mean = pi0_fast_ctx["state_mean"].to(env.device)
+                        s_std = pi0_fast_ctx["state_std"].to(env.device)
+                        norm_state = (state - s_mean) / (s_std + 1e-8)
+                    else:
+                        norm_state = state
+                    state_np = norm_state.cpu().numpy()
+                    task_text = smolvla_lang_instruction.strip().replace("_", " ").replace("\n", " ")
+                    prompts = []
+                    for i in range(state_np.shape[0]):
+                        disc = np.digitize(state_np[i], bins=np.linspace(-1, 1, 257)[:-1]) - 1
+                        prompts.append(f"Task: {task_text}, State: {' '.join(map(str, disc))};\n")
+                else:
+                    task_text = smolvla_lang_instruction.strip().replace("_", " ").replace("\n", " ")
+                    prompts = [f"Task: {task_text}, State: ;\n"] * env.num_envs
+                tokenized_lang = paligemma_tok(
+                    prompts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pi0_fast_ctx.get("tokenizer_max_length", 200),
+                )
+                obs[OBS_LANGUAGE_TOKENS] = tokenized_lang["input_ids"].to(env.device)
+                obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_lang["attention_mask"].bool().to(env.device)
+
             action = policy.select_action(obs)
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -562,59 +602,11 @@ def main(cfg: argparse.Namespace):
     image_transforms_config = ImageTransformsConfig(enable=True)
     image_transforms = ImageTransforms(image_transforms_config)
 
-    # Optional single-task filtering: select only episodes for one task_index.
-    # lerobot/libero_*_image datasets contain 10 tasks; use --task_index 0-9
-    # to train on a single task instead of all tasks.
-    episode_indices = None
-    if cfg.task_index is not None:
-        logger.info(f"Filtering dataset to task_index={cfg.task_index}…")
-
-        # Load the parquet data to build an episode_index → task_index map.
-        # We use a temporary LeRobotDataset with empty delta_timestamps so that
-        # no temporal padding / lookup is required.
-        probe_ds = LeRobotDataset(
-            cfg.dataset,
-            delta_timestamps={},
-            download_videos=False,
-            video_backend="pyav",
-        )
-
-        # hf_dataset has one row per *frame*; we only need one row per episode.
-        ep_col = probe_ds.hf_dataset["episode_index"]
-        task_col = probe_ds.hf_dataset["task_index"]
-
-        ep_to_task: dict[int, int] = {}
-        for ep_idx, t_idx in zip(ep_col, task_col):
-            ep_int = int(ep_idx)
-            if ep_int not in ep_to_task:
-                ep_to_task[ep_int] = int(t_idx)
-
-        del probe_ds
-
-        episode_indices = sorted(
-            ep_idx for ep_idx, t_idx in ep_to_task.items()
-            if t_idx == cfg.task_index
-        )
-
-        if not episode_indices:
-            available = sorted(set(ep_to_task.values()))
-            raise ValueError(
-                f"No episodes found for task_index={cfg.task_index}. "
-                f"Available task indices: {available}"
-            )
-
-        task_desc = ds_meta.tasks.get(cfg.task_index, "")
-        logger.info(
-            f"  task_index={cfg.task_index}: '{task_desc}' → "
-            f"{len(episode_indices)} episodes selected."
-        )
-
     dataset = LeRobotDataset(
         cfg.dataset,
         delta_timestamps=delta_timestamps,
         download_videos=True,
         image_transforms=image_transforms,
-        episodes=episode_indices,
     )
 
     # ---------------------------------------------------------------------
@@ -634,8 +626,40 @@ def main(cfg: argparse.Namespace):
     # ------------------------------------------------------------------
     # Policy + optimiser
     # ------------------------------------------------------------------
-    policy = make_policy(policy_cfg, ds_meta=ds_meta)
+    policy = VecEnvPolicy(make_policy(policy_cfg, ds_meta=ds_meta))
     policy.train()
+
+    # For language-conditioned policies, build a tokenizer and a task_index → task_str lookup
+    smolvla_tokenizer = None
+    smolvla_task_lookup = None
+    if cfg.policy in ("smolvla", "multi_task_dit", "pi0", "pi05"):
+        from transformers import AutoTokenizer
+        tokenizer_model_name = (
+            getattr(policy_cfg, "vlm_model_name", None)
+            or getattr(policy_cfg, "text_encoder_name", None)
+            or "google/paligemma-3b-pt-224"  # pi0, pi05 have no tokenizer name field
+        )
+        smolvla_tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
+        smolvla_task_lookup = {i: task_str for i, task_str in enumerate(ds_meta.tasks.index)}
+
+    # Pi0Fast requires pre-tokenized actions (FAST) and language prompts (PaliGemma).
+    # Both tokenizers are already loaded inside the policy; reuse them here.
+    pi0_fast_ctx = None
+    if cfg.policy == "pi0_fast":
+        inner_policy = policy.policy
+        action_stats = (ds_meta.stats or {}).get("action")
+        state_stats = (ds_meta.stats or {}).get("observation.state")
+        pi0_fast_ctx = {
+            "action_tok": inner_policy.action_tokenizer,
+            "paligemma_tok": inner_policy._paligemma_tokenizer,
+            "action_mean": torch.tensor(action_stats["mean"], dtype=torch.float32) if action_stats else None,
+            "action_std": torch.tensor(action_stats["std"], dtype=torch.float32) if action_stats else None,
+            "state_mean": torch.tensor(state_stats["mean"], dtype=torch.float32) if state_stats else None,
+            "state_std": torch.tensor(state_stats["std"], dtype=torch.float32) if state_stats else None,
+            "task_lookup": {i: s for i, s in enumerate(ds_meta.tasks.index)},
+            "tokenizer_max_length": policy_cfg.tokenizer_max_length,
+        }
+        smolvla_task_lookup = pi0_fast_ctx["task_lookup"]
 
     # Print the policy config
     print(policy_cfg)
@@ -726,46 +750,15 @@ def main(cfg: argparse.Namespace):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = start_step
-    eval_env = None  # type: ignore  # will hold the evaluation environment if created
 
     # Track the best evaluation success-rate achieved so far (used for early-stopping style checkpointing)
     best_success_rate = 0.0
 
+    eval_num_tasks = 0
     if cfg.rollout_freq and cfg.eval_suite:
-        # ------------------------------------------------------------------
-        # Create the DexMimicGen evaluation environment
-        # ------------------------------------------------------------------
-        device_str = "cpu" if cfg.device == "cpu" else "cuda"
-
-        # Create evaluation environment (vectorized or single based on debug flag)
-        logger.info(f"Creating evaluation environment: {cfg.eval_suite}")
-
-        if cfg.debug:
-            # Debug mode: use synchronous vectorized environment for easier debugging
-            logger.info("Debug mode enabled: using synchronous vectorized environment")
-            eval_env = create_vectorized_libero_env(
-                task_suite_name=cfg.eval_suite,
-                task_id=cfg.eval_task_id,
-                num_envs=cfg.eval_num_envs,
-                device=device_str,
-                camera_size=cfg.eval_camera_size,
-                render_size=cfg.eval_render_size,
-                video_key=cfg.eval_video_key,
-                debug=True,
-            )
-        else:
-            # Production mode: use asynchronous multiprocessing environment for speed
-            logger.info("Production mode: using asynchronous multiprocessing environment")
-            eval_env = create_vectorized_libero_env(
-                task_suite_name=cfg.eval_suite,
-                task_id=cfg.eval_task_id,
-                num_envs=cfg.eval_num_envs,
-                device=device_str,
-                camera_size=cfg.eval_camera_size,
-                render_size=cfg.eval_render_size,
-                video_key=cfg.eval_video_key,
-                debug=False,
-            )
+        logger.info(f"Multi-task evaluation enabled for suite: {cfg.eval_suite}")
+        eval_num_tasks = _get_suite_num_tasks(cfg.eval_suite)
+        logger.info(f"Will evaluate all {eval_num_tasks} tasks in suite '{cfg.eval_suite}' every {cfg.rollout_freq} steps")
 
     while step < cfg.steps:
         # ------------------------------------------------------------------
@@ -780,6 +773,86 @@ def main(cfg: argparse.Namespace):
         for key, val in batch.items():
             if isinstance(val, torch.Tensor):
                 batch[key] = val.to(device, non_blocking=True)
+
+        # Language-conditioned policies require tokenized task instructions in the batch
+        if smolvla_tokenizer is not None:
+            task_indices = batch["task_index"].squeeze(-1).tolist()
+            task_strs = [smolvla_task_lookup[int(i)] + "\n" for i in task_indices]
+            padding = getattr(policy_cfg, "pad_language_to", None) or getattr(policy_cfg, "tokenizer_padding", "max_length")
+            tokenized = smolvla_tokenizer(
+                task_strs,
+                return_tensors="pt",
+                padding=padding,
+                truncation=True,
+                max_length=policy_cfg.tokenizer_max_length,
+            )
+            batch[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(device)
+
+        # Pi0Fast requires FAST-tokenized actions and PaliGemma language prompts.
+        if pi0_fast_ctx is not None:
+            action_tok = pi0_fast_ctx["action_tok"]
+            paligemma_tok = pi0_fast_ctx["paligemma_tok"]
+            task_lookup = pi0_fast_ctx["task_lookup"]
+
+            # Normalize actions (MEAN_STD) before FAST tokenization
+            actions = batch["action"]  # (B, H, action_dim)
+            if pi0_fast_ctx["action_mean"] is not None:
+                a_mean = pi0_fast_ctx["action_mean"].to(device)
+                a_std = pi0_fast_ctx["action_std"].to(device)
+                actions = (actions - a_mean) / (a_std + 1e-8)
+
+            # FAST-tokenize each sample in the batch
+            fast_skip = policy_cfg.fast_skip_tokens
+            max_act_tok = policy_cfg.max_action_tokens
+            tokens_list, masks_list = [], []
+            for i in range(actions.shape[0]):
+                raw = action_tok(actions[i : i + 1].cpu())
+                tok = torch.tensor(raw, dtype=torch.long) if not isinstance(raw, torch.Tensor) else raw.long()
+                if tok.dim() > 1:
+                    tok = tok.flatten()
+                # Convert to PaliGemma vocabulary space
+                pg_tok = paligemma_tok.vocab_size - 1 - fast_skip - tok
+                bos = torch.tensor([paligemma_tok.bos_token_id])
+                prefix = torch.tensor(paligemma_tok.encode("Action: ", add_special_tokens=False))
+                suffix = torch.tensor(paligemma_tok.encode("|"))
+                tok = torch.cat([bos, prefix, pg_tok, suffix])
+                if len(tok) >= max_act_tok:
+                    tok = tok[:max_act_tok]
+                    mask = torch.ones(max_act_tok, dtype=torch.bool)
+                else:
+                    pad = max_act_tok - len(tok)
+                    mask = torch.cat([torch.ones(len(tok), dtype=torch.bool), torch.zeros(pad, dtype=torch.bool)])
+                    tok = torch.nn.functional.pad(tok, (0, pad), value=0)
+                tokens_list.append(tok)
+                masks_list.append(mask)
+            batch[ACTION_TOKENS] = torch.stack(tokens_list).to(device)
+            batch[ACTION_TOKEN_MASK] = torch.stack(masks_list).to(device)
+
+            # Build PaliGemma language prompts: "Task: {task}, State: {discretized_state};\n"
+            obs_state = batch["observation.state"]
+            state = obs_state[:, -1, :] if obs_state.dim() == 3 else obs_state  # (B, state_dim)
+            if pi0_fast_ctx["state_mean"] is not None:
+                s_mean = pi0_fast_ctx["state_mean"].to(device)
+                s_std = pi0_fast_ctx["state_std"].to(device)
+                state = (state - s_mean) / (s_std + 1e-8)
+            state_np = state.cpu().numpy()
+            task_indices = batch["task_index"].squeeze(-1).tolist()
+            full_prompts = []
+            for i, tidx in enumerate(task_indices):
+                task = task_lookup[int(tidx)].strip().replace("_", " ").replace("\n", " ")
+                disc = np.digitize(state_np[i], bins=np.linspace(-1, 1, 257)[:-1]) - 1
+                full_prompts.append(f"Task: {task}, State: {' '.join(map(str, disc))};\n")
+            tokenized_lang = paligemma_tok(
+                full_prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=policy_cfg.tokenizer_max_length,
+            )
+            batch[OBS_LANGUAGE_TOKENS] = tokenized_lang["input_ids"].to(device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_lang["attention_mask"].bool().to(device)
+
         data_load_ms = (time.perf_counter() - data_t0) * 1000
 
         # ------------------------------------------------------------------
@@ -812,7 +885,7 @@ def main(cfg: argparse.Namespace):
                 f" | iter: {iter_ms:.1f} ms"
             )
             logger.info(msg)
-            if wandb is not None:
+            if cfg.wandb_enable:
                 wandb.log(
                     {
                         "train/loss": loss_val,
@@ -845,7 +918,7 @@ def main(cfg: argparse.Namespace):
                 )
             )
 
-            if wandb is not None:
+            if cfg.wandb_enable:
                 # Log model-only artifact (no optimizer)
                 art_model = wandb.Artifact(name=f"run_{wandb.run.id}_model_step_{step}", type="model")
                 art_model.add_dir(str(model_dir))
@@ -868,46 +941,78 @@ def main(cfg: argparse.Namespace):
             and step != start_step
         ):
             rollout_t0 = time.perf_counter()
+            device_str = "cpu" if cfg.device == "cpu" else "cuda"
 
-            success_rate, video_path, final_fps = _run_rollouts(
-                policy=policy,
-                env=eval_env,
-                save_dir=output_dir,
-                step=step,
-                num_episodes=cfg.eval_num_episodes,
-                run_start_time=run_start_time,
-                eval_suite=cfg.eval_suite,
-                eval_task_id=cfg.eval_task_id,
-            )
+            task_success_rates: dict[int, float] = {}
+            last_video_path = None
+            last_env_fps = 20
 
+            for task_id in range(eval_num_tasks):
+                logger.info(colored(f"[step {step:>6d}] evaluating task {task_id}/{eval_num_tasks - 1}…", "cyan"))
+                task_env = create_vectorized_libero_env(
+                    task_suite_name=cfg.eval_suite,
+                    task_id=task_id,
+                    num_envs=cfg.eval_num_envs,
+                    device=device_str,
+                    camera_size=cfg.eval_camera_size,
+                    render_size=cfg.eval_render_size,
+                    video_key=cfg.eval_video_key,
+                    debug=cfg.debug,
+                )
+
+                success_rate, video_path, final_fps = _run_rollouts(
+                    policy=policy,
+                    env=task_env,
+                    save_dir=output_dir,
+                    step=step,
+                    num_episodes=cfg.eval_num_episodes,
+                    run_start_time=run_start_time,
+                    eval_suite=cfg.eval_suite,
+                    eval_task_id=task_id,
+                    smolvla_tokenizer=smolvla_tokenizer,
+                    smolvla_lang_instruction=smolvla_task_lookup.get(task_id) if smolvla_task_lookup else None,
+                    pi0_fast_ctx=pi0_fast_ctx,
+                )
+
+                last_env_fps = getattr(task_env, "fps", 20)
+                task_env.close()
+
+                task_success_rates[task_id] = success_rate
+                logger.info(
+                    colored(
+                        f"[step {step:>6d}] task {task_id} success-rate: {success_rate * 100:.1f}%",
+                        "cyan",
+                    )
+                )
+                last_video_path = video_path
+
+            mean_success_rate = sum(task_success_rates.values()) / len(task_success_rates)
             rollout_ms = (time.perf_counter() - rollout_t0) * 1_000
 
             logger.info(
                 colored(
-                    f"[step {step:>6d}] eval success-rate: {success_rate * 100:.1f}% | "
-                    f"rollout: {rollout_ms / 1000:.2f} s | {final_fps:.1f} fps",
+                    f"[step {step:>6d}] mean success-rate: {mean_success_rate * 100:.1f}% | "
+                    f"rollout: {rollout_ms / 1000:.2f} s",
                     "cyan",
                 )
             )
 
-            if wandb is not None:
-                wandb.log(
-                    {
-                        "eval/success_rate": success_rate,
-                        "time/rollout_ms": rollout_ms,
-                    },
-                    step=step,
-                )
-                if video_path is not None and video_path.exists():
-                    fps = eval_env.fps
-                    wandb.log({"eval/rollout_video": wandb.Video(str(video_path), format="mp4", fps=fps)}, step=step)
+            if cfg.wandb_enable:
+                log_dict = {f"eval/task_{tid}_success_rate": sr for tid, sr in task_success_rates.items()}
+                log_dict["eval/mean_success_rate"] = mean_success_rate
+                log_dict["time/rollout_ms"] = rollout_ms
+                wandb.log(log_dict, step=step)
+                if last_video_path is not None and last_video_path.exists():
+                    wandb.log({"eval/rollout_video": wandb.Video(str(last_video_path), format="mp4", fps=last_env_fps)}, step=step)
+
+            success_rate = mean_success_rate
 
             # -------------------------------------------------------------
             # Checkpoint the model whenever we obtain a new best success-rate
             # -------------------------------------------------------------
             if success_rate > best_success_rate:
                 best_success_rate = success_rate
-                logger.info(colored(f"New best success-rate! Saving checkpoint at step {step}", "magenta"))
+                logger.info(colored(f"New best mean success-rate ({best_success_rate * 100:.1f}%)! Saving checkpoint at step {step}", "magenta"))
 
                 # 1) Save model-only weights for lightweight history
                 best_model_dir = output_dir / f"best_step_{step}"
@@ -921,18 +1026,15 @@ def main(cfg: argparse.Namespace):
                     shutil.rmtree(best_dir)
                 save_checkpoint(best_dir, step, policy, optimizer)
 
-                if wandb is not None:
+                if cfg.wandb_enable:
                     # Overwrite/refresh the "best" artifact so that the most recent best checkpoint is easy to retrieve
                     art_best = wandb.Artifact(name=f"run_{wandb.run.id}_best", type="model")
                     art_best.add_dir(str(best_dir))
                     wandb.log_artifact(art_best, aliases=["best", "latest"])
 
     logger.info(colored("Training finished!", "green", attrs=["bold"]))
-    if wandb is not None:
+    if cfg.wandb_enable:
         wandb.finish()
-
-    if eval_env is not None:
-        eval_env.close()
 
     # ---------------------------------------------------------------------
     # Cleanup --------------------------------------------------------------

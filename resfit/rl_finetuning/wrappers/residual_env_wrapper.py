@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
 
 
 class BasePolicyVecEnvWrapper:
@@ -37,14 +37,14 @@ class BasePolicyVecEnvWrapper:
     def __init__(
         self,
         vec_env: VectorizedEnvWrapper,
-        base_policy: ACTPolicy,
+        base_policy: VecEnvPolicy,
         action_scaler,
         state_standardizer,
     ):
         """
         Args:
             vec_env: Vectorized environment from create_vectorized_env
-            base_policy: Base policy (e.g., ACTPolicy) to augment with residual actions
+            base_policy: Base policy wrapped with VecEnvPolicy to augment with residual actions
             action_scaler: ActionScaler object for scaling/unscaling actions (REQUIRED)
             state_standardizer: StateStandardizer object for standardizing states (REQUIRED)
         """
