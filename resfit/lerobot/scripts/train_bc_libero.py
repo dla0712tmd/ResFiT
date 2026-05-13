@@ -55,7 +55,7 @@ from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
 import wandb
-from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+from lerobot.utils.constants import ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from resfit.libero.environments.libero import LIBERO_TASK_SUITES, VectorizedLiberoEnvWrapper, create_vectorized_libero_env
 from lerobot.policies.factory import make_policy, make_policy_config
 from resfit.lerobot.policies.vec_env_policy import VecEnvPolicy
@@ -93,7 +93,8 @@ parser.add_argument(
         "act",
         "latent_act",
         "pi0",
-        "pi0fast",
+        "pi0_fast",
+        "pi05",
         "tdmpc",
         "vqbet",
         "multi_task_dit",
@@ -291,6 +292,7 @@ def _run_rollouts(
     eval_task_id: int,
     smolvla_tokenizer=None,
     smolvla_lang_instruction: str | None = None,
+    pi0_fast_ctx: dict | None = None,
 ):
     """Run *num_episodes* episodes with *policy* in vectorized *env* and compute success-rate.
 
@@ -350,6 +352,37 @@ def _run_rollouts(
                 )
                 obs[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(env.device)
                 obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(env.device)
+
+            # Pi0Fast: build "Task: ..., State: ...;\n" prompts from current obs state
+            if pi0_fast_ctx is not None and smolvla_lang_instruction is not None:
+                paligemma_tok = pi0_fast_ctx["paligemma_tok"]
+                state = obs.get("observation.state")
+                if state is not None:
+                    if pi0_fast_ctx["state_mean"] is not None:
+                        s_mean = pi0_fast_ctx["state_mean"].to(env.device)
+                        s_std = pi0_fast_ctx["state_std"].to(env.device)
+                        norm_state = (state - s_mean) / (s_std + 1e-8)
+                    else:
+                        norm_state = state
+                    state_np = norm_state.cpu().numpy()
+                    task_text = smolvla_lang_instruction.strip().replace("_", " ").replace("\n", " ")
+                    prompts = []
+                    for i in range(state_np.shape[0]):
+                        disc = np.digitize(state_np[i], bins=np.linspace(-1, 1, 257)[:-1]) - 1
+                        prompts.append(f"Task: {task_text}, State: {' '.join(map(str, disc))};\n")
+                else:
+                    task_text = smolvla_lang_instruction.strip().replace("_", " ").replace("\n", " ")
+                    prompts = [f"Task: {task_text}, State: ;\n"] * env.num_envs
+                tokenized_lang = paligemma_tok(
+                    prompts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pi0_fast_ctx.get("tokenizer_max_length", 200),
+                )
+                obs[OBS_LANGUAGE_TOKENS] = tokenized_lang["input_ids"].to(env.device)
+                obs[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_lang["attention_mask"].bool().to(env.device)
+
             action = policy.select_action(obs)
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -599,7 +632,7 @@ def main(cfg: argparse.Namespace):
     # For language-conditioned policies, build a tokenizer and a task_index → task_str lookup
     smolvla_tokenizer = None
     smolvla_task_lookup = None
-    if cfg.policy in ("smolvla", "multi_task_dit"):
+    if cfg.policy in ("smolvla", "multi_task_dit", "pi0", "pi05"):
         from transformers import AutoTokenizer
         tokenizer_model_name = (
             getattr(policy_cfg, "vlm_model_name", None)
@@ -608,6 +641,25 @@ def main(cfg: argparse.Namespace):
         )
         smolvla_tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
         smolvla_task_lookup = {i: task_str for i, task_str in enumerate(ds_meta.tasks.index)}
+
+    # Pi0Fast requires pre-tokenized actions (FAST) and language prompts (PaliGemma).
+    # Both tokenizers are already loaded inside the policy; reuse them here.
+    pi0_fast_ctx = None
+    if cfg.policy == "pi0_fast":
+        inner_policy = policy.policy
+        action_stats = (ds_meta.stats or {}).get("action")
+        state_stats = (ds_meta.stats or {}).get("observation.state")
+        pi0_fast_ctx = {
+            "action_tok": inner_policy.action_tokenizer,
+            "paligemma_tok": inner_policy._paligemma_tokenizer,
+            "action_mean": torch.tensor(action_stats["mean"], dtype=torch.float32) if action_stats else None,
+            "action_std": torch.tensor(action_stats["std"], dtype=torch.float32) if action_stats else None,
+            "state_mean": torch.tensor(state_stats["mean"], dtype=torch.float32) if state_stats else None,
+            "state_std": torch.tensor(state_stats["std"], dtype=torch.float32) if state_stats else None,
+            "task_lookup": {i: s for i, s in enumerate(ds_meta.tasks.index)},
+            "tokenizer_max_length": policy_cfg.tokenizer_max_length,
+        }
+        smolvla_task_lookup = pi0_fast_ctx["task_lookup"]
 
     # Print the policy config
     print(policy_cfg)
@@ -737,6 +789,70 @@ def main(cfg: argparse.Namespace):
             batch[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
             batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(device)
 
+        # Pi0Fast requires FAST-tokenized actions and PaliGemma language prompts.
+        if pi0_fast_ctx is not None:
+            action_tok = pi0_fast_ctx["action_tok"]
+            paligemma_tok = pi0_fast_ctx["paligemma_tok"]
+            task_lookup = pi0_fast_ctx["task_lookup"]
+
+            # Normalize actions (MEAN_STD) before FAST tokenization
+            actions = batch["action"]  # (B, H, action_dim)
+            if pi0_fast_ctx["action_mean"] is not None:
+                a_mean = pi0_fast_ctx["action_mean"].to(device)
+                a_std = pi0_fast_ctx["action_std"].to(device)
+                actions = (actions - a_mean) / (a_std + 1e-8)
+
+            # FAST-tokenize each sample in the batch
+            fast_skip = policy_cfg.fast_skip_tokens
+            max_act_tok = policy_cfg.max_action_tokens
+            tokens_list, masks_list = [], []
+            for i in range(actions.shape[0]):
+                raw = action_tok(actions[i : i + 1].cpu())
+                tok = torch.tensor(raw, dtype=torch.long) if not isinstance(raw, torch.Tensor) else raw.long()
+                if tok.dim() > 1:
+                    tok = tok.flatten()
+                # Convert to PaliGemma vocabulary space
+                pg_tok = paligemma_tok.vocab_size - 1 - fast_skip - tok
+                bos = torch.tensor([paligemma_tok.bos_token_id])
+                prefix = torch.tensor(paligemma_tok.encode("Action: ", add_special_tokens=False))
+                suffix = torch.tensor(paligemma_tok.encode("|"))
+                tok = torch.cat([bos, prefix, pg_tok, suffix])
+                if len(tok) >= max_act_tok:
+                    tok = tok[:max_act_tok]
+                    mask = torch.ones(max_act_tok, dtype=torch.bool)
+                else:
+                    pad = max_act_tok - len(tok)
+                    mask = torch.cat([torch.ones(len(tok), dtype=torch.bool), torch.zeros(pad, dtype=torch.bool)])
+                    tok = torch.nn.functional.pad(tok, (0, pad), value=0)
+                tokens_list.append(tok)
+                masks_list.append(mask)
+            batch[ACTION_TOKENS] = torch.stack(tokens_list).to(device)
+            batch[ACTION_TOKEN_MASK] = torch.stack(masks_list).to(device)
+
+            # Build PaliGemma language prompts: "Task: {task}, State: {discretized_state};\n"
+            obs_state = batch["observation.state"]
+            state = obs_state[:, -1, :] if obs_state.dim() == 3 else obs_state  # (B, state_dim)
+            if pi0_fast_ctx["state_mean"] is not None:
+                s_mean = pi0_fast_ctx["state_mean"].to(device)
+                s_std = pi0_fast_ctx["state_std"].to(device)
+                state = (state - s_mean) / (s_std + 1e-8)
+            state_np = state.cpu().numpy()
+            task_indices = batch["task_index"].squeeze(-1).tolist()
+            full_prompts = []
+            for i, tidx in enumerate(task_indices):
+                task = task_lookup[int(tidx)].strip().replace("_", " ").replace("\n", " ")
+                disc = np.digitize(state_np[i], bins=np.linspace(-1, 1, 257)[:-1]) - 1
+                full_prompts.append(f"Task: {task}, State: {' '.join(map(str, disc))};\n")
+            tokenized_lang = paligemma_tok(
+                full_prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=policy_cfg.tokenizer_max_length,
+            )
+            batch[OBS_LANGUAGE_TOKENS] = tokenized_lang["input_ids"].to(device)
+            batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_lang["attention_mask"].bool().to(device)
+
         data_load_ms = (time.perf_counter() - data_t0) * 1000
 
         # ------------------------------------------------------------------
@@ -855,6 +971,7 @@ def main(cfg: argparse.Namespace):
                     eval_task_id=task_id,
                     smolvla_tokenizer=smolvla_tokenizer,
                     smolvla_lang_instruction=smolvla_task_lookup.get(task_id) if smolvla_task_lookup else None,
+                    pi0_fast_ctx=pi0_fast_ctx,
                 )
 
                 last_env_fps = getattr(task_env, "fps", 20)
