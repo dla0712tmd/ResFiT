@@ -96,6 +96,7 @@ parser.add_argument(
         "pi0fast",
         "tdmpc",
         "vqbet",
+        "multi_task_dit",
         "smolvla",
     ],
     help="Which policy architecture to train",
@@ -337,7 +338,7 @@ def _run_rollouts(
     while done_episodes < num_episodes:
         # Run episodes in parallel until we complete the required number
         with torch.inference_mode():
-            # SmolVLA requires tokenized language instructions in the observation
+            # SmolVLA / multi_task_dit: simple task-string tokenization
             if smolvla_tokenizer is not None and smolvla_lang_instruction is not None:
                 task_strs = [smolvla_lang_instruction + "\n"] * env.num_envs
                 tokenized = smolvla_tokenizer(
@@ -595,12 +596,17 @@ def main(cfg: argparse.Namespace):
     policy = VecEnvPolicy(make_policy(policy_cfg, ds_meta=ds_meta))
     policy.train()
 
-    # For SmolVLA, build a tokenizer and a task_index → task_str lookup
+    # For language-conditioned policies, build a tokenizer and a task_index → task_str lookup
     smolvla_tokenizer = None
     smolvla_task_lookup = None
-    if cfg.policy == "smolvla":
+    if cfg.policy in ("smolvla", "multi_task_dit"):
         from transformers import AutoTokenizer
-        smolvla_tokenizer = AutoTokenizer.from_pretrained(policy_cfg.vlm_model_name)
+        tokenizer_model_name = (
+            getattr(policy_cfg, "vlm_model_name", None)
+            or getattr(policy_cfg, "text_encoder_name", None)
+            or "google/paligemma-3b-pt-224"  # pi0, pi05 have no tokenizer name field
+        )
+        smolvla_tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
         smolvla_task_lookup = {i: task_str for i, task_str in enumerate(ds_meta.tasks.index)}
 
     # Print the policy config
@@ -716,14 +722,15 @@ def main(cfg: argparse.Namespace):
             if isinstance(val, torch.Tensor):
                 batch[key] = val.to(device, non_blocking=True)
 
-        # SmolVLA requires tokenized language instructions in the batch
+        # Language-conditioned policies require tokenized task instructions in the batch
         if smolvla_tokenizer is not None:
             task_indices = batch["task_index"].squeeze(-1).tolist()
             task_strs = [smolvla_task_lookup[int(i)] + "\n" for i in task_indices]
+            padding = getattr(policy_cfg, "pad_language_to", None) or getattr(policy_cfg, "tokenizer_padding", "max_length")
             tokenized = smolvla_tokenizer(
                 task_strs,
                 return_tensors="pt",
-                padding=policy_cfg.pad_language_to,
+                padding=padding,
                 truncation=True,
                 max_length=policy_cfg.tokenizer_max_length,
             )

@@ -19,8 +19,8 @@ sed -i '/from .modeling_groot import GrootPolicy/d' \
 # Install lerobot
 python -m pip install -e "$DEPS_DIR/lerobot" --no-deps
 
-# Install smolvla extras (transformers, accelerate, safetensors, num2words)
-python -m pip install -e "$DEPS_DIR/lerobot[smolvla]" --no-deps
+# Install extras
+python -m pip install -e "$DEPS_DIR/lerobot[multi_task_dit, smolvla]" --no-deps
 python -m pip install "transformers==5.3.0" "num2words>=0.5.14,<0.6.0" "accelerate>=1.7.0,<2.0.0" "safetensors>=0.4.3,<1.0.0"
 
 # Install a couple of dependencies
